@@ -21,6 +21,7 @@
 namespace E
 {
 
+#define MSS 512
 
 #define RTT 100000000	//0.1 second in nanoseconds
 
@@ -39,6 +40,8 @@ namespace E
 
 /* For all sockets */
 enum class TCP_state{NONE, LISTEN, SYNSENT, SYNRCVD, ESTAB, FIN_WAIT1, FIN_WAIT2, CLOSING, TIME_WAIT, CLOSE_WAIT, LAST_ACK, CLOSED};
+enum class CONGESTION_state{SLOW_START, FAST_RECOVERY, CONGESTION_AVOIDANCE};
+
 
 struct socket{
 	//sockets for all processes stored in one place, need pid to search.
@@ -104,11 +107,15 @@ struct socket{
 	bool timer_running;
 	UUID timer_uuid;
 
-	int duplicate_ack;
-
 	bool sender_fin_number;
 
 	UUID close_uuid;
+
+	//congestion control
+	CONGESTION_state congestion_state;
+	uint32_t cwnd;
+	uint32_t ssthresh;
+	int duplicate_ack;
 };
 
 //20 bytes.
@@ -186,6 +193,7 @@ private:
 	/* Helper functions */
 	virtual void free_resources(Packet * packet, struct TCP_header * header);
 	virtual int minimum2(int a, int b);
+	virtual int minimum3(int a, int b, int c);
 	virtual int minimum4(int a, int b, int c,int d);
 
 	/* Pending connection*/

@@ -200,12 +200,30 @@ void TCPAssignment::fake_write(UUID syscallUUID, int pid, int sockfd, void * buf
 	socket->w_buffer = NULL;
 	socket->w_n = 0;
 
-	//control flow- when rwnd is 0
-	N = minimum4(51200-socket->write_buffer_size, n, 512, socket->last_rwnd);
-	if(N == 0){
-		// this->returnSystemCall(syscallUUID, 0);
+
+
+	//get the amount of unacked data sender can send.
+	uint32_t unacked_possible = minimum2(socket->last_rwnd, socket->cwnd);
+	if(socket->write_buffer_size >= unacked_possible){//happens when cwnd reduced due to loss.
+		socket->write_block = true;
+		socket->write_uuid = syscallUUID;
+		socket->w_buffer = char_buffer;
+		socket->w_n = n;
 		return;
 	}
+
+	//find out how much new data to send
+	assert(unacked_possible >= socket->write_buffer_size);
+	N = minimum4(unacked_possible - socket->write_buffer_size, 51200-socket->write_buffer_size, n, MSS);
+	if(N<512){
+		// std::cout<<"dont send less than 512\n";
+		socket->write_block = true;
+		socket->write_uuid = syscallUUID;
+		socket->w_buffer = char_buffer;
+		socket->w_n = n;
+		return;
+	}
+	assert(N!=0);
 
 	packet = makeDataPacket((void *)char_buffer, N,
 		socket->source_ip, socket->dest_ip,
@@ -222,7 +240,6 @@ void TCPAssignment::fake_write(UUID syscallUUID, int pid, int sockfd, void * buf
 	}
 	this->sendPacket("IPv4", this->clonePacket(packet));
 	this->returnSystemCall(syscallUUID, N);
-
 
 	return;
 }
@@ -649,6 +666,15 @@ void TCPAssignment::timerCallback(void* payload)
 	struct socket * socket = (struct socket *) payload;
 
 
+	//timeout- begin slow start again
+		//for fin retrasmits, don't matter what happens.
+	if(socket->state == TCP_state::ESTAB){
+		socket->congestion_state = CONGESTION_state::SLOW_START;
+		socket->ssthresh = socket->cwnd/2;
+		socket->cwnd = MSS;
+		socket->duplicate_ack = 0;
+	}
+
 	//for now assert, since we are only donig retransmission timers.
 	assert(!socket->write_buffer->empty());
 	assert(socket->timer_running);
@@ -970,6 +996,7 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 		else if(rcv_header->flags == ACK_FLAG){
 
 			if(packet->getSize() == 54){//Pure ACK packet
+				// std::cout<<"pure ack arrived\n";
 				int ack_number;
 				int seq_number;
 				int data_length;
@@ -997,6 +1024,25 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 
 				//if there are packets to be acked in write buffer
 				if( within_write_buffer_window(socket,ack_number)){
+
+					//congestion control
+					if(socket->congestion_state == CONGESTION_state::SLOW_START){
+						socket->cwnd += MSS;
+						socket->duplicate_ack = 0;
+						if(socket->cwnd >= socket->ssthresh){
+							socket->congestion_state = CONGESTION_state::CONGESTION_AVOIDANCE;
+						}
+					}
+					else if(socket->congestion_state==CONGESTION_state::CONGESTION_AVOIDANCE){
+						socket->cwnd += ((MSS*MSS)/socket->cwnd);
+						socket->duplicate_ack = 0;
+					}	
+					else if(socket->congestion_state==CONGESTION_state::FAST_RECOVERY){
+						socket->congestion_state=CONGESTION_state::CONGESTION_AVOIDANCE;
+						socket->cwnd = socket->ssthresh;
+						socket->duplicate_ack = 0;
+					}
+
 
 					while(seq_number != ack_number){
 						//remove from list and free
@@ -1036,11 +1082,21 @@ void TCPAssignment::packetArrived(std::string fromModule, Packet* packet)
 				//duplicate ack
 				else{
 					if(seq_number == ack_number){
-						socket->duplicate_ack++;
-						if(socket->duplicate_ack == 3){
-							socket->duplicate_ack = 0;
-							Packet * e = socket->write_buffer->front();
-							this->sendPacket("IPv4", this->clonePacket(e));
+						// std::cout<<"duplicate ack\n";
+						if(socket->congestion_state==CONGESTION_state::SLOW_START ||
+							socket->congestion_state==CONGESTION_state::CONGESTION_AVOIDANCE){
+							socket->duplicate_ack++;
+							if(socket->duplicate_ack == 3){
+								socket->congestion_state = CONGESTION_state::FAST_RECOVERY;
+								socket->ssthresh = socket->cwnd/2;
+								socket->cwnd = socket->ssthresh + 3;
+								Packet * e = socket->write_buffer->front();
+								this->sendPacket("IPv4", this->clonePacket(e));
+							}
+						}
+						//fast recovery already
+						else{
+							socket->cwnd += MSS;
 						}
 					}
 					//other acks ignored(ack no.<seq no.)- late arriving acks of retransmitted packets.
@@ -1746,9 +1802,13 @@ void TCPAssignment::find_and_remove_from_list(std::list<struct socket *> * list,
 struct socket * TCPAssignment::create_socket(int pid, int fd){
 	struct socket * e = new struct socket;
 
+	e->congestion_state = CONGESTION_state::SLOW_START;
+	e->duplicate_ack = 0;
+	e->cwnd = MSS;
+	e->ssthresh = 51200;
+
 	e->timer_uuid = 0;
 	e->timer_running = false;
-	e->duplicate_ack = 0;
 
 	e->estab_list = NULL;
 	e->pending_list = NULL;
@@ -1925,6 +1985,18 @@ int TCPAssignment::minimum2(int a, int b){
 		return a;
 	}else{
 		return b;
+	}
+}
+
+int TCPAssignment::minimum3(int a, int b, int c){
+	if(a <= b && a<= c){
+		return a;
+	}
+	else if(b <= a && b <= c){
+		return b;
+	}
+	else{
+		return c;
 	}
 }
 
